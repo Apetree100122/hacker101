@@ -1,0 +1,116 @@
+name: "github-action-auto-format"
+description: "Run auto-formatting functionality for different aspects of a repo. (See scripts for details.)"
+inputs:
+  actions-files-checkout-path:
+    description: 'The path on the github-runner where the auto-format action scripts are checked out at runtime'
+    default: github-action-auto-format
+    required: false
+  bot-name:
+    description: "GitHub username for writing new commits"
+    required: false
+    default: itsolutions
+  bot-email:
+    description: "Email address associated with the GitHub user for writing new commits"
+    required: false
+  format-task:
+    description: "Name of formatting task to execute. (Options include: readme, github, terraform, and context.)"
+    required: true
+  workflow-token:
+    description: "GitHub Token for use in `github_format.sh` and PR creation steps. This token must be granted `workflows` permissions."
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    # Checkout repo
+    - name: "Checkout commit"
+      uses: actions/checkout@v2
+      with:
+        ref: ${{ github.event.pull_request.head.ref }}
+        token: ${{ inputs.workflow-token }}
+
+    # Assets that are checked out as part of an action are not mounted into subsequent container steps.
+    # Therefore, we need to checkout the action code within the workdir to access it within the container steps.
+    - name: "Checkout github-action-auto-format repo to load script locally on runner"
+      uses: actions/checkout@v2
+      with:
+        repository: cloudposse/github-action-auto-format
+        path: ${{ inputs.actions-files-checkout-path }}
+
+    # Git config
+    - name: "Git config"
+      if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}    
+      shell: bash
+      run: |
+        # Construct bot-email from inputs.bot-name if inputs.bot-email not provided
+        bot_id=$(curl -sSL 'https://api.github.com/users/${{ inputs.bot-name }}' | jq .id)
+        if [ -z ${{ inputs.bot-email }} ]; then
+          bot_email=${bot_id}+${{ inputs.bot-name }}@users.noreply.github.com
+        else
+          bot_email=${{ inputs.bot-email }}
+        fi
+        # configure git
+        git config --local user.name "${{ inputs.bot-name }}"
+        git config --local user.email "${bot_email}"
+        git config --global --add safe.directory /github/workspace
+
+    # Run self-tests when calling from cloudposse/github-action-auto-format repo
+    - name: "Carry out self-tests"
+      if: ${{ contains( github.repository, 'cloudposse/github-action-auto-format') }}
+      uses: docker://cloudposse/build-harness:latest
+      with:
+        entrypoint: /github/workspace/${{ inputs.actions-files-checkout-path }}/scripts/${{ inputs.format-task }}/test.sh
+      env:
+        IGNORE_PATH: ${{ inputs.actions-files-checkout-path }}
+        EVENT_TYPE: ${{ github.event_name }}
+
+    # Run requested formatting when running from user repos, as follows
+    # readme: Rebuild README.md and commit changes (if any) to the PR branch
+    # github: Add and commit standard .github files to the PR branch
+    # terrform: Format Terraform files and commit changes (if any) to the PR branch
+    # context: Ensure that context.tf is up to date and commit new context.tf (if any) to the PR branch
+    - name: "Carry out requested formatting"
+      if: ${{ ! contains( github.repository, 'cloudposse/github-action-auto-format') }}
+      uses: docker://cloudposse/build-harness:latest
+      with:
+        entrypoint: /github/workspace/${{ inputs.actions-files-checkout-path }}/scripts/${{ inputs.format-task }}/format.sh
+      env:
+        IGNORE_PATH: ${{ inputs.actions-files-checkout-path }}
+        HOST_REPO: ${{ github.repository }}
+        EVENT_TYPE: ${{ github.event_name }}
+
+    # Set PR parameters for soon-to-be-opened PR
+    - name: "Set PR parameters"
+      id: pr-parameters
+      if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+      shell: bash
+      run: |
+        # run script
+        "/github/workspace/${{ inputs.actions-files-checkout-path }}/scripts/${{ inputs.format-task }}/pr_parameters.sh"
+
+    # Cleanup checked out action files, since the pull request will add and commit all files indiscriminately
+    - name: "Clean up github-action-auto-format repo"
+      shell: bash
+      run: |
+        rm -r ${{ inputs.actions-files-checkout-path }}
+
+    # If triggered by a pull request, push all committed changes
+    - name: "Push to pre-existing PR branch"
+      if: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+      shell: bash
+      run: |
+        # Prevent looping by not pushing changes in response to changes from cloudpossebot
+        [[ "${{ github.event.sender.login }}" ==  "${{ inputs.bot-name }}" ]] || git push
+
+
+    # If triggered by cron event or manually, create pull request for any committed changes
+    - name: "Create pull request and PR branch"
+      if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+      uses: peter-evans/create-pull-request@v4
+      with:
+        token: ${{ inputs.workflow-token }}
+        commit-message: ${{ steps.pr-parameters.outputs.pr-commit-message }}
+        title: ${{ steps.pr-paramters.outputs.pr-title }}
+        body: ${{ steps.pr-parameters.outputs.pr-body }}
+        labels: ${{ steps.pr-parameters.outputs.pr-labels }}
+        branch: github-action-auto-format
